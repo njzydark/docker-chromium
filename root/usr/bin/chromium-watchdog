@@ -1,0 +1,30 @@
+#!/bin/bash
+
+stop=0
+current_pid=
+
+stop_watchdog() {
+  stop=1
+
+  if [ -n "${current_pid}" ]; then
+    kill "${current_pid}" 2>/dev/null || true
+  fi
+}
+
+trap stop_watchdog INT TERM
+
+while [ "${stop}" -eq 0 ]; do
+  wrapped-chromium "$@" &
+  current_pid=$!
+  wait "${current_pid}"
+  current_pid=
+
+  if [ "${stop}" -ne 0 ]; then
+    break
+  fi
+
+  sleep 1 &
+  current_pid=$!
+  wait "${current_pid}"
+  current_pid=
+done

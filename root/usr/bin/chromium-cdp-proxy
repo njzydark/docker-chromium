@@ -1,0 +1,262 @@
+#!/usr/bin/python3
+
+import asyncio
+import os
+
+
+LISTEN_HOST = os.environ.get("CDP_PROXY_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("CDP_PROXY_PORT", "9223"))
+UPSTREAM_HOST = os.environ.get("CDP_UPSTREAM_HOST", "127.0.0.1")
+UPSTREAM_PORT = int(os.environ.get("CDP_UPSTREAM_PORT", "9222"))
+PUBLIC_HOST = os.environ.get("CDP_PUBLIC_HOST", "").strip()
+PUBLIC_PORT = os.environ.get("CDP_PUBLIC_PORT", "").strip()
+PUBLIC_SCHEME = os.environ.get("CDP_PUBLIC_SCHEME", "").strip().lower()
+
+
+async def read_headers(reader):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = await reader.read(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > 65536:
+            raise ValueError("headers too large")
+    return bytes(data)
+
+
+def split_headers(data):
+    head, sep, tail = data.partition(b"\r\n\r\n")
+    if not sep:
+        raise ValueError("incomplete headers")
+    return head.decode("iso-8859-1"), tail
+
+
+def rewrite_request_headers(header_text):
+    lines = header_text.split("\r\n")
+    request_line = lines[0]
+    headers = []
+    host_header = None
+    upgrade = False
+
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+
+        name, value = line.split(":", 1)
+        lname = name.strip().lower()
+        value = value.strip()
+
+        if lname == "host":
+            host_header = value
+            headers.append(("Host", "localhost"))
+            continue
+
+        if lname == "proxy-connection":
+            continue
+
+        if lname == "connection":
+            upgrade = "upgrade" in value.lower()
+            if upgrade:
+                headers.append(("Connection", "Upgrade"))
+            else:
+                headers.append(("Connection", "close"))
+            continue
+
+        if lname == "upgrade" and value.lower() == "websocket":
+            upgrade = True
+
+        headers.append((name, value))
+
+    if not any(name.lower() == "host" for name, _ in headers):
+        headers.append(("Host", "localhost"))
+
+    if not any(name.lower() == "connection" for name, _ in headers):
+        headers.append(("Connection", "Upgrade" if upgrade else "close"))
+
+    rendered = [request_line] + [f"{name}: {value}" for name, value in headers]
+    return "\r\n".join(rendered).encode("iso-8859-1") + b"\r\n\r\n", host_header or f"127.0.0.1:{LISTEN_PORT}", upgrade
+
+
+def parse_content_length(headers):
+    for line in headers.split("\r\n")[1:]:
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name.strip().lower() == "content-length":
+            return int(value.strip())
+    return None
+
+
+def is_json_response(headers):
+    for line in headers.split("\r\n")[1:]:
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name.strip().lower() == "content-type":
+            return "application/json" in value.lower()
+    return False
+
+
+def is_websocket_upgrade(headers):
+    status_line = headers.split("\r\n", 1)[0]
+    if " 101 " not in f" {status_line} ":
+        return False
+
+    for line in headers.split("\r\n")[1:]:
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        if name.strip().lower() == "upgrade" and value.strip().lower() == "websocket":
+            return True
+    return False
+
+
+def rewrite_response_headers(headers, body_len):
+    rendered = []
+    for index, line in enumerate(headers.split("\r\n")):
+        if index == 0:
+            rendered.append(line)
+            continue
+
+        if not line or ":" not in line:
+            continue
+
+        name, value = line.split(":", 1)
+        lname = name.strip().lower()
+
+        if lname == "content-length":
+            rendered.append(f"Content-Length: {body_len}")
+            continue
+
+        if lname == "connection":
+            rendered.append("Connection: close")
+            continue
+
+        if lname == "transfer-encoding":
+            continue
+
+        rendered.append(f"{name}: {value.strip()}")
+
+    if not any(line.lower().startswith("content-length:") for line in rendered[1:]):
+        rendered.append(f"Content-Length: {body_len}")
+
+    if not any(line.lower().startswith("connection:") for line in rendered[1:]):
+        rendered.append("Connection: close")
+
+    return "\r\n".join(rendered).encode("iso-8859-1") + b"\r\n\r\n"
+
+
+def resolve_external_endpoint(host_header):
+    external_host = PUBLIC_HOST or host_header
+
+    if PUBLIC_PORT:
+        host_only = external_host.split(":", 1)[0]
+        external_host = f"{host_only}:{PUBLIC_PORT}"
+
+    scheme = PUBLIC_SCHEME
+    if not scheme:
+        scheme = "wss" if LISTEN_PORT == 443 else "ws"
+
+    return scheme, external_host
+
+
+def rewrite_json_body(body, host_header):
+    scheme, external_host = resolve_external_endpoint(host_header)
+    replacements = (
+        f"ws://127.0.0.1:{UPSTREAM_PORT}",
+        f"ws://localhost:{UPSTREAM_PORT}",
+        "ws://localhost",
+    )
+    text = body.decode("utf-8")
+    for source in replacements:
+        text = text.replace(source, f"{scheme}://{external_host}")
+    return text.encode("utf-8")
+
+
+async def pipe(reader, writer):
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def handle_client(client_reader, client_writer):
+    upstream_writer = None
+    try:
+        request_blob = await read_headers(client_reader)
+        if not request_blob:
+            return
+
+        request_headers, request_tail = split_headers(request_blob)
+        outbound_headers, host_header, upgrade = rewrite_request_headers(request_headers)
+        content_length = parse_content_length(request_headers)
+        request_body = request_tail
+        if content_length is not None and len(request_body) < content_length:
+            request_body += await client_reader.readexactly(content_length - len(request_body))
+
+        upstream_reader, upstream_writer = await asyncio.open_connection(UPSTREAM_HOST, UPSTREAM_PORT)
+        upstream_writer.write(outbound_headers + request_body)
+        await upstream_writer.drain()
+
+        response_blob = await read_headers(upstream_reader)
+        response_headers, response_tail = split_headers(response_blob)
+
+        if upgrade and is_websocket_upgrade(response_headers):
+            client_writer.write(response_blob)
+            await client_writer.drain()
+            await asyncio.gather(
+                pipe(client_reader, upstream_writer),
+                pipe(upstream_reader, client_writer),
+            )
+            return
+
+        response_body = response_tail
+        response_length = parse_content_length(response_headers)
+
+        if response_length is not None and len(response_body) < response_length:
+            response_body += await upstream_reader.readexactly(response_length - len(response_body))
+        elif response_length is None:
+            response_body += await upstream_reader.read()
+
+        if is_json_response(response_headers):
+            response_body = rewrite_json_body(response_body, host_header)
+            rewritten_headers = rewrite_response_headers(response_headers, len(response_body))
+            client_writer.write(rewritten_headers + response_body)
+        else:
+            client_writer.write(response_headers.encode("iso-8859-1") + b"\r\n\r\n" + response_body)
+
+        await client_writer.drain()
+    except Exception:
+        pass
+    finally:
+        if upstream_writer is not None:
+            try:
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
+            except Exception:
+                pass
+        try:
+            client_writer.close()
+            await client_writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def main():
+    server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

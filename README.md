@@ -69,6 +69,8 @@ The application can be accessed at:
 
 * https://yourhost:3001/
 
+Chromium is started under a lightweight watchdog in this image. If the browser process is closed, it will be relaunched automatically with the same CLI arguments.
+
 ### Strict reverse proxies
 
 This image uses a self-signed certificate by default. This naturally means the scheme is `https`.
@@ -190,6 +192,14 @@ This container is based on [Docker Baseimage Selkies](https://github.com/linuxse
 | CUSTOM_HTTPS_PORT | Internal port the container listens on for https if it needs to be swapped from the default `3001` |
 | CUSTOM_WS_PORT | Internal port the container listens on for websockets if it needs to be swapped from the default 8082 |
 | CUSTOM_USER | HTTP Basic auth username, abc is default. |
+| ENABLE_CDP_PROXY | If set to `true`, starts a built-in reverse proxy for Chromium's remote debugging endpoint. This is useful when Chromium only binds CDP to loopback inside the container. |
+| CDP_PROXY_HOST | Host/IP for the built-in CDP proxy listener, default `0.0.0.0` |
+| CDP_PROXY_PORT | Port for the built-in CDP proxy listener, default `9223` |
+| CDP_UPSTREAM_HOST | Upstream Chromium CDP host used by the built-in proxy, default `127.0.0.1` |
+| CDP_UPSTREAM_PORT | Upstream Chromium CDP port used by the built-in proxy, default `9222` |
+| CDP_PUBLIC_HOST | Optional public hostname to publish in rewritten CDP `webSocketDebuggerUrl` responses. Defaults to the incoming request host. |
+| CDP_PUBLIC_PORT | Optional public port to publish in rewritten CDP `webSocketDebuggerUrl` responses. |
+| CDP_PUBLIC_SCHEME | Optional websocket scheme to publish in rewritten CDP `webSocketDebuggerUrl` responses, typically `ws` or `wss`. |
 | DRI_NODE | **Encoding GPU**: Enable VAAPI/NVENC stream encoding and use the specified device IE `/dev/dri/renderD128` |
 | DRINODE | **Rendering GPU**: Specify which GPU to use for EGL/3D acceleration IE `/dev/dri/renderD129` |
 | PASSWORD | HTTP Basic auth password, abc is default. If unset there will be no auth |
@@ -447,6 +457,34 @@ docker run -d \
   lscr.io/linuxserver/chromium:latest
 ```
 
+### Optional CDP proxy example
+
+Chromium's remote debugging endpoint may remain bound to `127.0.0.1` inside the container even when `--remote-debugging-address=0.0.0.0` is set. To expose CDP externally, enable the built-in proxy and publish its port instead of Chromium's internal CDP port directly.
+
+```yaml
+---
+services:
+  chromium:
+    image: lscr.io/linuxserver/chromium:latest
+    container_name: chromium
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - ENABLE_CDP_PROXY=true
+      - CHROME_CLI=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 https://www.linuxserver.io/ #optional
+      - CDP_PUBLIC_HOST=chromium.example.com #optional
+      - CDP_PUBLIC_PORT=443 #optional
+      - CDP_PUBLIC_SCHEME=wss #optional
+    ports:
+      - 3001:3001
+      - 9222:9223
+    shm_size: "1gb"
+    restart: unless-stopped
+```
+
+With the proxy enabled, querying `http://yourhost:9222/json/version` will return a rewritten `webSocketDebuggerUrl` that points at the externally reachable address. If you are fronting the container with TLS or a reverse proxy, set `CDP_PUBLIC_HOST`, `CDP_PUBLIC_PORT`, and `CDP_PUBLIC_SCHEME` so CDP clients receive the correct public websocket URL.
+
 ## Parameters
 
 Containers are configured using parameters passed at runtime (such as those above). These parameters are separated by a colon and indicate `<external>:<internal>` respectively. For example, `-p 8080:80` would expose port `80` from inside the container to be accessible from the host's IP on port `8080` outside the container.
@@ -455,10 +493,15 @@ Containers are configured using parameters passed at runtime (such as those abov
 | :----: | --- |
 | `-p 3000:3000` | HTTP Chromium desktop gui, must be proxied. |
 | `-p 3001:3001` | HTTPS Chromium desktop gui. |
+| `-p 9222:9223` | Optional. Publish the built-in CDP proxy externally. The proxy listens on internal port `9223` and forwards to Chromium's internal CDP endpoint. |
 | `-e PUID=1000` | for UserID - see below for explanation |
 | `-e PGID=1000` | for GroupID - see below for explanation |
 | `-e TZ=Etc/UTC` | specify a timezone to use, see this [list](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List). |
 | `-e CHROME_CLI=https://www.linuxserver.io/` | Specify one or multiple Chromium CLI flags, this string will be passed to the application in full. |
+| `-e ENABLE_CDP_PROXY=true` | Optional. Start the built-in CDP reverse proxy for external remote debugging access. |
+| `-e CDP_PUBLIC_HOST=chromium.example.com` | Optional. Override the hostname returned in rewritten CDP `webSocketDebuggerUrl` responses. |
+| `-e CDP_PUBLIC_PORT=443` | Optional. Override the port returned in rewritten CDP `webSocketDebuggerUrl` responses. |
+| `-e CDP_PUBLIC_SCHEME=wss` | Optional. Override the websocket scheme returned in rewritten CDP `webSocketDebuggerUrl` responses. |
 | `-v /config` | Users home directory in the container, stores local files and settings |
 | `--shm-size=` | This is needed for any modern website to function like youtube. |
 

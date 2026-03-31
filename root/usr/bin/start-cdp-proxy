@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if [ "${ENABLE_CDP_PROXY}" != "true" ]; then
+  exit 0
+fi
+
+if pgrep -f "/usr/bin/chromium-cdp-proxy" > /dev/null; then
+  exit 0
+fi
+
+/usr/bin/chromium-cdp-proxy > /dev/null 2>&1 &
